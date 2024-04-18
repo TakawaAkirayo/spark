@@ -48,8 +48,8 @@ object SparkConnectServer extends Logging {
       }
       SparkConnectService.server.awaitTermination()
     } finally {
+      SparkConnectService.stop()
       session.stop()
-      SparkConnectService.uiTab.foreach(_.detach())
     }
   }
 }
