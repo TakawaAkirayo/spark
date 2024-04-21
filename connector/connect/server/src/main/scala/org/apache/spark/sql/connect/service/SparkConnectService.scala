@@ -283,6 +283,7 @@ class SparkConnectService(debug: Boolean) extends AsyncService with BindableServ
 object SparkConnectService extends Logging {
 
   private[connect] var server: Server = _
+  private[connect] var serviceAddress: InetSocketAddress = _
 
   private[connect] var uiTab: Option[SparkConnectServerTab] = None
   private[connect] var listener: SparkConnectServerListener = _
@@ -369,6 +370,13 @@ object SparkConnectService extends Logging {
     }
     server = sb.build
     server.start()
+
+    // There should be only one address. According to the `server.port()`,
+    // find the first `InetSocketAddress` as the actual address
+    server.getListenSockets.asScala.find(_.isInstanceOf[InetSocketAddress])
+      .foreach {
+        case isa: InetSocketAddress => serviceAddress = isa
+      }
   }
 
   // Starts the service
@@ -380,23 +388,22 @@ object SparkConnectService extends Logging {
 
     startGRPCService()
     createListenerAndUI(sc)
-    started = false
 
+    started = true
+    stopped = false
     postSparkConnectServiceStarted(sc)
   }
 
   def stop(timeout: Option[Long] = None, unit: Option[TimeUnit] = None): Unit = synchronized {
-    if (!started) {
-      throw new IllegalStateException(
-        "Attempting to stop the Spark Connect service that has not been started.")
-    }
-
     if (stopped) {
       logWarning("The Spark Connect service has already been stopped.")
       return
     }
 
-    postSparkConnectServiceEnd()
+    if (!started) {
+      throw new IllegalStateException(
+        "Attempting to stop the Spark Connect service that has not been started.")
+    }
 
     if (server != null) {
       if (timeout.isDefined && unit.isDefined) {
@@ -410,7 +417,10 @@ object SparkConnectService extends Logging {
     executionManager.shutdown()
     sessionManager.shutdown()
     uiTab.foreach(_.detach())
+
+    started = false
     stopped = true
+    postSparkConnectServiceEnd()
   }
 
   /**
@@ -443,21 +453,17 @@ object SparkConnectService extends Logging {
    */
   private def postServiceEvent(eventBuilder: InetSocketAddress => SparkListenerEvent): Unit = {
     // Sanity checks
-    if (server == null) {
+    if (serviceAddress == null) {
       throw new IllegalStateException(
-        "The Spark Connect event was dropped because the server has not been set.")
+        "The Spark Connect event was dropped because the internal server has not been set " +
+          "or the actual binding address can not be found.")
     }
     if (listenerBus == null) {
       throw new IllegalStateException(
         "The Spark Connect event was dropped because the listener bus has not been set.")
     }
 
-    // There should be only one address. According to the `server.port()`,
-    // find the first `InetSocketAddress` as the actual address
-    server.getListenSockets.asScala.find(_.isInstanceOf[InetSocketAddress])
-      .foreach {
-        case isa: InetSocketAddress => listenerBus.post(eventBuilder(isa))
-      }
+    listenerBus.post(eventBuilder(serviceAddress))
   }
 
   def extractErrorMessage(st: Throwable): String = {
@@ -495,8 +501,7 @@ case class SparkListenerConnectServiceStarted(
   extends SparkListenerEvent
 
 /**
- * The event is sent to inform that Spark Connect service begins its shutdown
- * or has already been shutdown.
+ * The event is sent to inform that Spark Connect service has already been shutdown.
  * This event indicates the end of the service, and any in-processing requests
  * or upcoming requests are not guaranteed to be handled properly by the service.
  *
