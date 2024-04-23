@@ -38,11 +38,12 @@ import org.apache.spark.connect.proto.SparkConnectServiceGrpc.AsyncService
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.UI.UI_ENABLED
 import org.apache.spark.scheduler.{LiveListenerBus, SparkListenerEvent}
-import org.apache.spark.sql.connect.config.Connect.{CONNECT_GRPC_BINDING_ADDRESS, CONNECT_GRPC_BINDING_PORT, CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT, CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE}
+import org.apache.spark.sql.connect.config.Connect.{CONNECT_GRPC_BINDING_ADDRESS, CONNECT_GRPC_BINDING_PORT, CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT, CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE, CONNECT_GRPC_PORT_MAX_RETRIES}
 import org.apache.spark.sql.connect.execution.ConnectProgressExecutionListener
 import org.apache.spark.sql.connect.ui.{SparkConnectServerAppStatusStore, SparkConnectServerListener, SparkConnectServerTab}
 import org.apache.spark.sql.connect.utils.ErrorUtils
 import org.apache.spark.status.ElementTrackingStore
+import org.apache.spark.util.Utils
 
 /**
  * The SparkConnectService implementation.
@@ -305,8 +306,9 @@ object SparkConnectService extends Logging {
   private[connect] val streamingSessionManager =
     new SparkConnectStreamingQueryCache()
 
-  @volatile private var started = false
-  @volatile private var stopped = false
+  // Package level private for testing purpose.
+  @volatile private[connect] var started = false
+  @volatile private[connect] var stopped = false
 
   /**
    * Based on the userId and sessionId, find or create a new SparkSession.
@@ -350,33 +352,49 @@ object SparkConnectService extends Logging {
   private def startGRPCService(): Unit = {
     val debugMode = SparkEnv.get.conf.getBoolean("spark.connect.grpc.debug.enabled", true)
     val bindAddress = SparkEnv.get.conf.get(CONNECT_GRPC_BINDING_ADDRESS)
-    val port = SparkEnv.get.conf.get(CONNECT_GRPC_BINDING_PORT)
-    val sb = bindAddress match {
-      case Some(hostname) =>
-        logInfo(s"start GRPC service at: $hostname")
-        NettyServerBuilder.forAddress(new InetSocketAddress(hostname, port))
-      case _ => NettyServerBuilder.forPort(port)
-    }
-    sb.maxInboundMessageSize(SparkEnv.get.conf.get(CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE).toInt)
-      .addService(new SparkConnectService(debugMode))
+    val startPort = SparkEnv.get.conf.get(CONNECT_GRPC_BINDING_PORT)
+    val sparkConnectService = new SparkConnectService(debugMode)
+    val protoReflectionService = if (debugMode) Some(ProtoReflectionService.newInstance()) else None
+    val configuredInterceptors = SparkConnectInterceptorRegistry.createConfiguredInterceptors()
 
-    // Add all registered interceptors to the server builder.
-    SparkConnectInterceptorRegistry.chainInterceptors(sb)
-
-    // If debug mode is configured, load the ProtoReflection service so that tools like
-    // grpcurl can introspect the API for debugging.
-    if (debugMode) {
-      sb.addService(ProtoReflectionService.newInstance())
-    }
-    server = sb.build
-    server.start()
-
-    // There should be only one address. According to the `server.port()`,
-    // find the first `InetSocketAddress` as the actual address
-    server.getListenSockets.asScala.find(_.isInstanceOf[InetSocketAddress])
-      .foreach {
-        case isa: InetSocketAddress => serviceAddress = isa
+    val startService = (port: Int) => {
+      val sb = bindAddress match {
+        case Some(hostname) =>
+          logInfo(s"start GRPC service at: $hostname")
+          NettyServerBuilder.forAddress(new InetSocketAddress(hostname, port))
+        case _ => NettyServerBuilder.forPort(port)
       }
+      sb.maxInboundMessageSize(SparkEnv.get.conf.get(CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE).toInt)
+        .addService(sparkConnectService)
+
+      // Add all registered interceptors to the server builder.
+      SparkConnectInterceptorRegistry.chainInterceptors(sb, configuredInterceptors)
+
+      // If debug mode is configured, load the ProtoReflection service so that tools like
+      // grpcurl can introspect the API for debugging.
+      protoReflectionService.foreach(service => sb.addService(service))
+
+      server = sb.build
+      server.start()
+
+      // There should be only one address, and the actual binding port
+      // can be different from the configured port when the configured port is 0.
+      // According to the `server.port()`, find the first `InetSocketAddress` as the actual address
+      serviceAddress = server.getListenSockets.asScala
+        .find(_.isInstanceOf[InetSocketAddress])
+        .get
+        .asInstanceOf[InetSocketAddress]
+
+      (server, server.getPort)
+    }
+
+    val maxRetries: Int = SparkEnv.get.conf.get(CONNECT_GRPC_PORT_MAX_RETRIES)
+    Utils.startServiceOnPort[Server](
+      startPort,
+      startService,
+      maxRetries,
+      getClass.getName
+    )
   }
 
   // Starts the service
