@@ -64,8 +64,7 @@ class SparkConnectServiceSuite extends SparkFunSuite with LocalSparkContext {
       withPortOccupied(startPort, startPort + 2) {
         SparkConnectService.start(sc)
         assert(SparkConnectService.started)
-        assert(SparkConnectService.serviceAddress != null)
-        assert(SparkConnectService.serviceAddress.getPort == startPort + 3) // 15005 available
+        assert(SparkConnectService.server.getPort == startPort + 3) // 15005 available
         SparkConnectService.stop()
       }
     }
@@ -124,10 +123,8 @@ class SparkConnectServiceSuite extends SparkFunSuite with LocalSparkContext {
         startedEventValidations.add((
           "The SparkConnectService should post it's address " +
             "by the `SparkListenerConnectServiceEnd` event",
-          SparkConnectService.serviceAddress != null &&
-            serviceStarted.port == SparkConnectService.serviceAddress.getPort &&
-            serviceStarted.hostAddress ==
-              SparkConnectService.serviceAddress.getAddress.getHostAddress
+            serviceStarted.bindingPort == SparkConnectService.server.getPort &&
+            serviceStarted.hostAddress == Utils.localCanonicalHostName()
         ))
       }
     ))
@@ -155,11 +152,8 @@ class SparkConnectServiceSuite extends SparkFunSuite with LocalSparkContext {
         endEventValidations.add((
           "The SparkConnectService should post it's address " +
             "by the `SparkListenerConnectServiceEnd` event",
-          SparkConnectService.serviceAddress != null &&
-            serviceEnd.port == SparkConnectService.serviceAddress.getPort &&
-            serviceEnd.hostAddress ==
-              SparkConnectService.serviceAddress.getAddress.getHostAddress
-        ))
+            serviceEnd.bindingPort == SparkConnectService.server.getPort &&
+            serviceEnd.hostAddress == SparkConnectService.hostAddress))
       }
     ))
 
@@ -179,9 +173,7 @@ class SparkConnectServiceSuite extends SparkFunSuite with LocalSparkContext {
 
     // The internal server of SparkConnectService should has
     // already been created and started in this time.
-    assert(SparkConnectService.started &&
-      SparkConnectService.server != null &&
-      SparkConnectService.serviceAddress != null)
+    assert(SparkConnectService.started && SparkConnectService.server != null)
 
     // The event `SparkListenerConnectServiceStarted` should be posted
     // during the startup of the SparkConnectService.
@@ -255,9 +247,7 @@ class SparkConnectServiceSuite extends SparkFunSuite with LocalSparkContext {
     assert(listenerInstance != null)
     // The internal server of SparkConnectService should has
     // already been created and started during the initializing of the SparkConnectPlugin.
-    assert(SparkConnectService.started &&
-      SparkConnectService.server != null &&
-      SparkConnectService.serviceAddress != null)
+    assert(SparkConnectService.started && SparkConnectService.server != null)
     // The event `SparkListenerConnectServiceStarted` should be posted and received by the listener
     startedEventSignal.acquire()
     // Only one `SparkListenerConnectServiceStarted` event should be received by the listener
@@ -273,6 +263,36 @@ class SparkConnectServiceSuite extends SparkFunSuite with LocalSparkContext {
 
     // The event `SparkListenerConnectServiceEnd` should be posted and received by the listener
     assert(listenerInstance.serviceEndEvents.size() == 1)
+  }
+
+  test("The listener is able to get the Spark information of SparkConnectService from the event") {
+    val startedEventSignal = new Semaphore(0)
+    SparkConnectServiceLifeCycleListener.checksOnServiceStartedEvent = Some(Seq(
+      _ => {
+        startedEventSignal.release()
+      }
+    ))
+
+    val conf = new SparkConf()
+      .setAppName(getClass().getName())
+      .set(SparkLauncher.SPARK_MASTER, "local[1]")
+    sc = new SparkContext(conf)
+
+    val listenerInstance = new SparkConnectServiceLifeCycleListener()
+    sc.addSparkListener(listenerInstance)
+
+    // Start the SparkConnectService and wait for the listener
+    // to receive the `SparkListenerConnectServiceStarted` event.
+    SparkConnectService.start(sc)
+    startedEventSignal.acquire()
+    // Now the listener should have already received the `SparkListenerConnectServiceStarted` event.
+    assert(listenerInstance.serviceStartedEvents.size() == 1)
+    val event = listenerInstance.serviceStartedEvents.get(0)
+    assert(event.hostAddress != null)
+    assert(event.sparkConf != null)
+    val sparkConf = event.sparkConf
+    assert(sparkConf.contains("spark.driver.host"))
+    assert(sparkConf.contains("spark.app.id"))
   }
 
   def withPortOccupied(startPort: Int, endPort: Int)(f: => Unit): Unit = {
